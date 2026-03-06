@@ -6,6 +6,13 @@ Structure:		Size(Byte)
 	FLAGS		1
 	DATA		2
 
+
+!  = network byte order (big endian)
+I  = unsigned int (4 bytes)  -> seq
+I  = unsigned int (4 bytes)  -> ack
+B  = unsigned char (1 byte)  -> flags
+H  = unsigned short (2 bytes) -> length
+
 | seq | ack | flags | length | data |
 
 ! = Network Byte Order (Big Endian)
