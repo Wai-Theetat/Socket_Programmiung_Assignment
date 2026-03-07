@@ -4,110 +4,134 @@ import threading
 from packet import Packet, FLAG_ACK, FLAG_DATA, FLAG_FIN
 
 # Macro
-TIME_OUT = 1.0			# sec before retransmit
+TIME_OUT = 0.5			# sec before retransmit
 MAX_PAYLOAD = 1000		# byte / data chunk
+WINDOW_SIZE = 32
 
 
-def send_reliable(sock, dest, seq, 	flags, data=b"", max_retries=30):
-	"""
-	Send a packet and wait for an ACK. Retransmits on timeout.
-	Returns the ACK packet, or raises RuntimeError after max_retries.
-	"""
-	pkt = Packet(seq=seq, flags=flags, data=data)
-	raw = pkt.pack()
-
-
-	for _ in range(max_retries):
-		sock.sendto(raw, dest)
-		deadline = time.time() + TIME_OUT
-
-		while True:
-			remaining = deadline - time.time()
-			if remaining <= 0:
-				break;
-			
-			sock.settimeout(remaining)
-			try:
-				response_raw, addr = sock.recvfrom(2048)
-				if addr != dest:
-					continue
-    
-				response = Packet.unpack(response_raw)
-				# Accept ACK for this seq number
-				if response.flags & FLAG_ACK and response.ack == seq + 1:
-					return response
-				# Duplicate / stale ACK — keep waiting
-			
-			except socket.timeout:
-				break	
-
-	raise RuntimeError(f"No ACK received after {max_retries} attempts")
-
-
+#---------- Sender ----------#
 def send_file(sock, dest, filename, file_data):
-	"""
-	send filename then file data in chunks, each ack.
-	Uses Stop-n-Wait with alternating seq (1-bit scheme: 1 and 2) to identify which one is dup
-	"""
-	seq = 1
+	# Build chunk list
+	chunks = [(FLAG_DATA, filename.encode())] 	#convert filename into b"filename"
+	offset = 0
 
-	#-------- Send Filename --------#
-	fname_bytes = filename.encode()
-	send_reliable(sock, dest, seq, FLAG_DATA, fname_bytes)
-	seq = 3 - seq 											# toggle between 1 and 2
-
-	#-------- Send file data in chunks --------#
-	offset = 0												# starting point
-	total = len(file_data)
-
-	while offset < total:
-		chunk = file_data[offset: offset + MAX_PAYLOAD]
-		send_reliable(sock, dest, seq, FLAG_DATA, chunk)
-		seq = 3 - seq
+	while offset < len(file_data):
+		chunk = file_data[offset:offset + MAX_PAYLOAD]
+		chunks.append((FLAG_DATA, chunk))
 		offset += len(chunk)
+	chunks.append((FLAG_FIN,b""))
 
-	#-------- Send FIN --------#
-	send_reliable(sock, dest, seq, FLAG_FIN)
+	total		= len(chunks)			# total number of packets to send
+	base		= 0						# oldest unACKed seq
+	next_seq	= 0						# next packet allowed to send
+	acked		= [False] * total		# whether packet i is ACKed
+	send_times	= [0.0] * total			# last send time (used for timeout retransmission)
 
+	lock		= threading.Lock()
+	done		= threading.Event()		# thread stop signal
 
-def recv_file(sock):
-	"""
-	Receive filename then file data until FIN.
-	Returns (filename, file_bytes).
-	Handles duplicate packets by tracking last accepted seq.
-	"""
-	
-	expected_seq = 1  						# toggles between 1 and 2
-	filename = None
-	chunks = []
-	first = True
+	# Receiver thread : Collecting ACKs
+	def ack_receiver():
+		nonlocal base
+		while not done.is_set():
+			try:
+				sock.settimeout(0.1)	
+				raw, _ = sock.recvfrom(2048)
+				pkt = Packet.unpack(raw)
+				if not (pkt.flags & FLAG_ACK):
+					continue
 
-	sock.settimeout(None)					# block until data arrives
+				seq = pkt.ack - 1
+				with lock:
+					if 0 <= seq < total:
+						acked[seq] = True
+					#Slide base
+					while base < total and acked[base]:
+						base += 1
 
-	while True:
-		raw, addr = sock.recvfrom(2048 + 64)
-		pkt = Packet.unpack(raw)
+			except socket.timeout:
+				continue
 
-		# Always ACK (including duplicates) so sender can move on
-		ack_pkt = Packet(seq=0, ack=pkt.seq + 1, flags=FLAG_ACK)
-		sock.sendto(ack_pkt.pack(), addr)
-
-		# FIN → done
-		if pkt.flags & FLAG_FIN:
-			if pkt.seq == expected_seq:
+			except Exception:
 				break
-			# duplicate FIN — already acked above, keep waiting isn't needed
+		
+	receiver_thread = threading.Thread(target=ack_receiver, daemon=True)
+	receiver_thread.start()
+
+	# Sender Loop: fill window + selective retransmit
+	while True:
+		with lock:
+			current_base = base
+
+		if current_base >= total:
+			break		# all packet ACKed
+
+		now = time.time()
+
+		with lock:
+			# Send new packet within window
+			while next_seq < total and next_seq < current_base + WINDOW_SIZE:
+				if not acked[next_seq]:
+					flags, data = chunks[next_seq]
+					pkt = Packet(seq=next_seq, flags=flags, data=data)
+					sock.sendto(pkt.pack(), dest)
+					send_times[next_seq] = now
+				next_seq += 1
+	
+			#Selective Retransmit
+			for i in range(current_base, min(next_seq, current_base + WINDOW_SIZE)):
+				if not acked[i] and (now - send_times[i] > TIME_OUT):
+					flags, data = chunks[i]
+					pkt = Packet(seq=i, flags=flags, data=data)
+					sock.sendto(pkt.pack(), dest)
+					send_times[i] = now					# reset timer
+     
+	done.set()
+	receiver_thread.join()
+	print(f"Transfer complete: {total} packets sent")
+
+
+#---------- Reciver ----------#
+def recv_file(sock):
+	expected_seq	= 0			# next seq
+	recv_buffer		= {}		# seq -> Packet
+	filename		= None
+	chunks			= []
+	fin_seq			= None
+ 
+	sock.settimeout(None)
+ 
+	while True:
+		raw, addr = sock.recvfrom(MAX_PAYLOAD + 64)
+		pkt = Packet.unpack(raw)
+		seq = pkt.seq
+  
+		# Always ACK every valid received packet
+		ack = Packet(seq=0, ack=seq + 1, flags=FLAG_ACK)
+		sock.sendto(ack.pack(), addr)
+  
+		# Buffer if in received window
+		if seq >= expected_seq and seq not in recv_buffer:
+			recv_buffer[seq] = pkt
+   
+		# Deliver Packet
+		while expected_seq in recv_buffer:
+			deliver = recv_buffer.pop(expected_seq)
+
+			if deliver.flags & FLAG_FIN:
+				fin_seq = expected_seq
+				expected_seq += 1
+				break
+
+			if deliver.flags & FLAG_DATA:
+				if expected_seq == 0:        # seq 0 = filename
+					filename = deliver.data.decode()
+				else:
+					chunks.append(deliver.data)
+				expected_seq += 1
+
+		# ── Done when FIN delivered ──
+		if fin_seq is not None:
 			break
-
-		if not (pkt.flags & FLAG_DATA):
-			continue
-
-		if pkt.seq == expected_seq:
-			if first:
-				filename = pkt.data.decode()
-				first = False
-			else:
-				chunks.append(pkt.data)
-			expected_seq = 3 - expected_seq
 
 	return filename, b"".join(chunks)

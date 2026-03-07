@@ -1,4 +1,4 @@
-mini TCP
+mini rdt3.0
 
 Structure:		Size(Byte)
 	SEQ			4
@@ -38,3 +38,19 @@ wait SYN
 send SYN-ACK
 wait ACK
 connection established
+
+
+# What does threading.Event() do ?
+An Event is basically a shared boolean flag between threads.
+
+Initial state:
+
+flag = False
+
+Threads can:
+
+Operation		Meaning
+set()			flag = True
+clear()			flag = False
+wait()			block until flag = True
+is_set()		check flag
